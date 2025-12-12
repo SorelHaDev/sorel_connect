@@ -1,10 +1,12 @@
 import aiohttp
 import asyncio
+import copy
+import hashlib
 import logging
 import os
 import json
 import time
-from typing import Optional
+from typing import Optional, Tuple
 import aiofiles
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,6 +31,34 @@ class MetaClient:
     def _cache_path(self, organization_id, device_enum_id, language, firmware_version):
         fname = f"meta_{organization_id}_{device_enum_id}_{language}_{firmware_version}.json"
         return os.path.join(self._cache_dir, fname)
+
+    def _compute_metadata_hash(self, metadata: dict) -> str:
+        """Compute hash of metadata excluding volatile fields like generatedAt."""
+        # Deep copy to avoid modifying original
+        data = copy.deepcopy(metadata)
+
+        # Remove volatile fields that change on every API request
+        if "meta" in data and isinstance(data["meta"], dict):
+            data["meta"].pop("generatedAt", None)
+
+        # Create deterministic JSON string (sorted keys)
+        json_str = json.dumps(data, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha256(json_str.encode()).hexdigest()[:16]
+
+    def _extract_from_cache(self, cache_data: dict) -> Tuple[dict, Optional[str]]:
+        """
+        Extract metadata from cache, handling both old and new format.
+
+        Returns:
+            Tuple of (metadata, checksum)
+            - metadata: The actual metadata dict
+            - checksum: The stored checksum (None for old format)
+        """
+        # New format: {"_checksum": "...", "_cached_at": ..., "data": {...}}
+        if "_checksum" in cache_data and "data" in cache_data:
+            return cache_data["data"], cache_data.get("_checksum")
+        # Old format: raw metadata
+        return cache_data, None
 
     def _can_poll(self, key):
         now = time.time()
@@ -141,9 +171,14 @@ class MetaClient:
                     self._record_permanent_failure(key)
                     return False
 
-                # Save to cache
+                # Save to cache with checksum for change detection
+                cache_wrapper = {
+                    "_checksum": self._compute_metadata_hash(data),
+                    "_cached_at": time.time(),
+                    "data": data
+                }
                 async with aiofiles.open(cache_file, "w", encoding="utf-8") as f:
-                    await f.write(json.dumps(data))
+                    await f.write(json.dumps(cache_wrapper))
 
                 # Record success
                 self._record_success(key)
@@ -176,12 +211,13 @@ class MetaClient:
             try:
                 async with aiofiles.open(cache_file, "r", encoding="utf-8") as f:
                     content = await f.read()
-                    data = json.loads(content)
+                    cache_data = json.loads(content)
+                # Extract metadata from cache (handles old and new format)
+                data, _ = self._extract_from_cache(cache_data)
                 # Also check cache for "Device not found" error
                 if isinstance(data, dict) and data.get("error") == "Device not found":
                     self._record_permanent_failure(key)
                     return None
-                # Optional: Check validity (e.g., max 7 days old)
                 _LOGGER.info(f"Metadata loaded from cache for {key}.")
                 return data
             except Exception as e:
@@ -202,7 +238,9 @@ class MetaClient:
             try:
                 async with aiofiles.open(cache_file, "r", encoding="utf-8") as f:
                     content = await f.read()
-                    return json.loads(content)
+                    cache_data = json.loads(content)
+                data, _ = self._extract_from_cache(cache_data)
+                return data
             except Exception as e:
                 _LOGGER.error(f"Error reading freshly saved cache: {e}")
 
@@ -211,17 +249,96 @@ class MetaClient:
             try:
                 async with aiofiles.open(cache_file, "r", encoding="utf-8") as f:
                     content = await f.read()
-                    data = json.loads(content)
-                    # Check here too for "Device not found"
-                    if isinstance(data, dict) and data.get("error") == "Device not found":
-                        self._record_permanent_failure(key)
-                        return None
-                    _LOGGER.info(f"Fallback to old cache for {key}")
-                    return data
+                    cache_data = json.loads(content)
+                data, _ = self._extract_from_cache(cache_data)
+                # Check here too for "Device not found"
+                if isinstance(data, dict) and data.get("error") == "Device not found":
+                    self._record_permanent_failure(key)
+                    return None
+                _LOGGER.info(f"Fallback to old cache for {key}")
+                return data
             except Exception:
                 pass
 
         return None
+
+    async def refresh_metadata(self, organization_id, device_enum_id) -> Tuple[Optional[dict], bool]:
+        """
+        Fetch fresh metadata from API and compare with cached version.
+
+        This method is called on startup to detect metadata changes.
+        If cache doesn't exist, this is first discovery - returns (metadata, False).
+
+        Returns:
+            Tuple of (metadata, has_changed)
+            - metadata: The metadata (fresh from API, or cached if API fails)
+            - has_changed: True if metadata differs from previously cached version
+        """
+        cache_file = self._cache_path(organization_id, device_enum_id, "en", "latest")
+        key = (organization_id, device_enum_id, "en", "latest")
+
+        # Check for permanently failed devices
+        if self._failed_count.get(key, 0) == -1:
+            _LOGGER.debug(f"Device {key} is permanently marked as unavailable.")
+            return None, False
+
+        # Read existing cache to get stored checksum
+        old_checksum = None
+        cached_metadata = None
+        if os.path.exists(cache_file):
+            try:
+                async with aiofiles.open(cache_file, "r", encoding="utf-8") as f:
+                    content = await f.read()
+                    cache_data = json.loads(content)
+                cached_metadata, old_checksum = self._extract_from_cache(cache_data)
+                # Check for "Device not found" error in cache
+                if isinstance(cached_metadata, dict) and cached_metadata.get("error") == "Device not found":
+                    self._record_permanent_failure(key)
+                    return None, False
+            except Exception as e:
+                _LOGGER.warning(f"Error reading cache for refresh: {e}")
+
+        # If no cache exists, this is first discovery - just fetch normally
+        if cached_metadata is None:
+            _LOGGER.debug(f"No cache exists for {key}, fetching for first time")
+            metadata = await self.get_metadata(organization_id, device_enum_id)
+            return metadata, False
+
+        # Fetch fresh metadata from API
+        self._last_poll[key] = time.time()
+        success = await self._fetch_metadata_direct(organization_id, device_enum_id)
+
+        if not success:
+            # API failed - return cached metadata, no change detected
+            _LOGGER.info(f"API fetch failed for {key}, using cached metadata")
+            return cached_metadata, False
+
+        # Read the newly cached metadata
+        try:
+            async with aiofiles.open(cache_file, "r", encoding="utf-8") as f:
+                content = await f.read()
+                cache_data = json.loads(content)
+            new_metadata, new_checksum = self._extract_from_cache(cache_data)
+        except Exception as e:
+            _LOGGER.error(f"Error reading refreshed cache: {e}")
+            return cached_metadata, False
+
+        # Compare checksums
+        has_changed = False
+        if old_checksum and new_checksum:
+            has_changed = old_checksum != new_checksum
+            if has_changed:
+                _LOGGER.info(f"Metadata changed for {key}: checksum {old_checksum} -> {new_checksum}")
+            else:
+                _LOGGER.debug(f"Metadata unchanged for {key}: checksum {new_checksum}")
+        elif old_checksum is None:
+            # Old format cache - compute checksum of old data and compare
+            old_computed = self._compute_metadata_hash(cached_metadata)
+            has_changed = old_computed != new_checksum
+            if has_changed:
+                _LOGGER.info(f"Metadata changed for {key} (migrated from old cache format)")
+
+        return new_metadata, has_changed
 
     def get_device_status(self, organization_id, device_enum_id) -> str:
         """

@@ -16,6 +16,7 @@ DEFAULT_API_URL = "/api/public/{organizationId}/device/{deviceEnumId}/metadata?l
 SIGNAL_NEW_DEVICE = f"{DOMAIN}_new_device"
 SIGNAL_DP_UPDATE = "sorel_dp_update"
 SIGNAL_MQTT_CONNECTION_STATE = f"{DOMAIN}_mqtt_connection_state"
+SIGNAL_METADATA_CHANGED = f"{DOMAIN}_metadata_changed"
 
 # --- Relay Modes --------------------------------------------------------------
 

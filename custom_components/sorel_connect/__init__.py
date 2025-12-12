@@ -8,7 +8,7 @@ import socket
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry, ConfigEntryNotReady
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_USERNAME, CONF_PASSWORD, Platform
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispatcher_connect
 
 from .const import (
     DOMAIN,
@@ -19,6 +19,7 @@ from .const import (
     DEFAULT_API_SERVER,
     DEFAULT_API_URL,
     SIGNAL_MQTT_CONNECTION_STATE,
+    SIGNAL_METADATA_CHANGED,
 )
 from .mqtt_client import MqttClient, HaMqttClient, CustomMqttClient
 from .meta_client import MetaClient
@@ -215,6 +216,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.exception("-INIT 5/5: Coordinator start failed")
         mqtt_client.stop()
         raise ConfigEntryNotReady from err
+
+    # 7) Register metadata change notification handler
+    async def on_metadata_changed(device_key: str):
+        """Handle metadata change detection - create persistent notification."""
+        _LOGGER.info("Metadata changed notification for device: %s", device_key)
+
+        # Create persistent notification
+        await hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "title": "Sorel Connect: Metadata Updated",
+                "message": (
+                    f"Device metadata has been updated for **{device_key}**.\n\n"
+                    "To apply the new sensor names and configurations, please reload the Sorel Connect integration:\n\n"
+                    "**Settings → Devices & Services → Sorel Connect → ⋮ → Reload**"
+                ),
+                "notification_id": f"sorel_metadata_changed_{device_key.replace(':', '_')}",
+            },
+        )
+
+    unsub_metadata = async_dispatcher_connect(
+        hass, SIGNAL_METADATA_CHANGED, on_metadata_changed
+    )
+    entry.async_on_unload(unsub_metadata)
 
     return True
 

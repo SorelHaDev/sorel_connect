@@ -6,7 +6,7 @@ from collections import defaultdict
 from typing import Dict, Set, List, Tuple, Any, Optional
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from .const import DOMAIN, SIGNAL_NEW_DEVICE, SIGNAL_DP_UPDATE
+from .const import DOMAIN, SIGNAL_NEW_DEVICE, SIGNAL_DP_UPDATE, SIGNAL_METADATA_CHANGED
 from .topic_parser import parse_topic, ParsedTopic
 from .sensor_types import (
     is_sensor_type_register,
@@ -47,6 +47,8 @@ class Coordinator:
         self._parsed_topics: dict[str, ParsedTopic] = {}
         # Full metadata storage: device_key -> full metadata dict (including "meta" section)
         self._full_metadata: dict[str, dict] = {}
+        # Devices with changed metadata (detected on startup refresh)
+        self._metadata_changed_devices: Set[str] = set()
 
     async def start(self) -> None:
         """Start the coordinator by subscribing to MQTT topics."""
@@ -96,13 +98,19 @@ class Coordinator:
 
             if device_enum_id:
                 try:
-                    meta = await self.meta.get_metadata(organization_id, device_enum_id)
+                    # Use refresh_metadata to detect changes from API
+                    meta, has_changed = await self.meta.refresh_metadata(organization_id, device_enum_id)
                     if meta:
                         # Store full metadata (including "meta" section)
                         self._full_metadata[pt.device_key] = meta
                         datapoints = meta.get("datapoints", [])
                         self.register_datapoints(pt.device_key, datapoints)
                         _LOGGER.info("Metadata for device %s loaded (%d datapoints)", pt.device_key, len(datapoints))
+                        # Track if metadata changed and notify
+                        if has_changed:
+                            self._metadata_changed_devices.add(pt.device_key)
+                            _LOGGER.warning("Metadata has changed for device %s - reload integration to apply changes", pt.device_key)
+                            async_dispatcher_send(self.hass, SIGNAL_METADATA_CHANGED, pt.device_key)
                     else:
                         _LOGGER.warning(f"No metadata available for device {pt.device_key}")
                 except Exception as e:
@@ -250,6 +258,19 @@ class Coordinator:
             Mode ID (int) if known, None if not yet received
         """
         return self._relay_mode_values.get(device_key, {}).get(relay_name)
+
+    def get_metadata_changed_devices(self) -> Set[str]:
+        """
+        Get the set of devices that have changed metadata since last startup.
+
+        Returns:
+            Set of device_key strings with changed metadata
+        """
+        return self._metadata_changed_devices.copy()
+
+    def clear_metadata_changed_devices(self) -> None:
+        """Clear the set of devices with changed metadata (after notification sent)."""
+        self._metadata_changed_devices.clear()
 
     def get_dp_at_address(self, device_key: str, address: int) -> Optional[dict]:
         """
